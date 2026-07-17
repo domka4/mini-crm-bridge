@@ -15,4 +15,6 @@ contextBridge.exposeInMainWorld('bridgeAPI', {
   loadAuth: () => ipcRenderer.invoke('load-auth'),
   clearAuth: () => ipcRenderer.invoke('clear-auth'),
   showNotification: (title, body) => ipcRenderer.send('show-notification', { title, body }),
+  getLogs: () => ipcRenderer.invoke('get-logs'),
+  onLog: (callback) => ipcRenderer.on('new-log', (_event, log) => callback(log)),
 });

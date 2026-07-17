@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import started from 'electron-squirrel-startup';
 import { Server as ProxyChainServer } from 'proxy-chain';
 import { createPinggyTunnel } from './tunnel.js';
+import { logger, setMainWindowForLogs, getLogs } from './logger.js';
 
 // ---------------------------------------------------------------------------
 // Estado global
@@ -48,6 +49,8 @@ function createWindow() {
       mainWindow.hide();
     }
   });
+
+  setMainWindowForLogs(mainWindow);
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +131,7 @@ async function ensureTunnel() {
         proxy_user: 'bridge_online',
         proxy_pass: proxyPass
       })
-    }).catch(console.error);
+    }).catch(err => logger.error('Erro ao atualizar proxy da instancia', { error: err.message }));
   }
 
   return tunnel;
@@ -216,18 +219,13 @@ ipcMain.handle('login', async (_event, { email, password }) => {
 ipcMain.handle('select-account', async (_event, { account_id }) => {
   try {
     currentAccountId = account_id;
-
-    // Inicia proxy + túnel automaticamente (tenta)
-    let tunnelUrl = '';
-    try {
-      await ensureTunnel();
-      if (tunnel) tunnelUrl = tunnel.url;
-    } catch(err) {
-      console.error('Falha ao iniciar tunel automaticamente:', err);
-    }
-
-    return { success: true, tunnelUrl };
+    logger.info(`Conta selecionada: ${account_id}`);
+    
+    // Não vamos bloquear a UI com o proxy no momento da seleção.
+    // Retornamos sucesso e o frontend iniciará o proxy (se precisar) async.
+    return { success: true, tunnelUrl: null };
   } catch (err) {
+    logger.error('Erro ao selecionar conta', { error: err.message });
     return { success: false, error: err.message || 'Erro ao selecionar conta.' };
   }
 });
@@ -264,7 +262,7 @@ ipcMain.handle('stop-proxy', async () => {
           account_id: currentAccountId,
           enabled: false
         })
-      }).catch(console.error);
+      }).catch(err => logger.error('Erro ao desativar proxy na instancia', { error: err.message }));
     }
 
     return { success: true };
@@ -424,4 +422,9 @@ ipcMain.handle('logout-instance', async (_event, { instance_name }) => {
   } catch (err) {
     return { success: false, error: err.message };
   }
+});
+
+// 13. Logs --------------------------------------------------------------------
+ipcMain.handle('get-logs', async () => {
+  return getLogs();
 });

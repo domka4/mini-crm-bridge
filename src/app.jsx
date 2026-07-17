@@ -13,6 +13,8 @@ import {
   Settings,
   LogOut,
   RotateCcw,
+  Bug,
+  Copy,
 } from 'lucide-react';
 import LogoWordmark from './assets/logo-wordmark.svg';
 import LogoFavicon from './assets/logo-favicon.svg';
@@ -116,7 +118,14 @@ function Titlebar() {
         </span>
       </div>
 
-      <div style={{ display: 'flex', gap: 8, WebkitAppRegion: 'no-drag' }}>
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center', WebkitAppRegion: 'no-drag' }}>
+        <button
+          onClick={() => window.dispatchEvent(new Event('toggle-logs'))}
+          style={{ background: 'transparent', border: 'none', color: C.textSec, cursor: 'pointer', display: 'flex', alignItems: 'center', padding: 0 }}
+          title="Ver Logs"
+        >
+          <Bug size={14} />
+        </button>
         <span
           role="button"
           tabIndex={0}
@@ -471,24 +480,22 @@ function MainScreen({ account, userEmail, tunnelUrl: initialTunnel, onLogout }) 
 
   useEffect(() => {
     loadInstances();
-    // Auto-start proxy if we got a tunnel URL from selectAccount
-    if (initialTunnel) {
-      (async () => {
-        setProxyStatus('connecting');
-        try {
-          const res = await window.bridgeAPI.startProxy();
-          if (res.success) {
-            setProxyStatus('connected');
-            setProxyUrl(res.url || initialTunnel);
-          } else {
-            setProxyStatus('off');
-          }
-        } catch {
+    // Auto-start proxy on mount
+    (async () => {
+      setProxyStatus('connecting');
+      try {
+        const res = await window.bridgeAPI.startProxy();
+        if (res.success) {
+          setProxyStatus('connected');
+          setProxyUrl(res.url);
+        } else {
           setProxyStatus('off');
         }
-      })();
-    }
-  }, [initialTunnel, loadInstances]);
+      } catch {
+        setProxyStatus('off');
+      }
+    })();
+  }, [loadInstances]);
 
   // Toast auto-hide
   useEffect(() => {
@@ -1182,6 +1189,85 @@ if (!document.getElementById('bridge-styles')) {
   document.head.appendChild(styleTag);
 }
 
+// ── Log Console Component ───────────────────────────────────────
+function LogConsole({ open, onClose }) {
+  const [logs, setLogs] = useState([]);
+  const logsEndRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const fetchInitial = async () => {
+      const initialLogs = await window.bridgeAPI.getLogs();
+      setLogs(initialLogs || []);
+    };
+    fetchInitial();
+
+    const unsubs = window.bridgeAPI.onLog((newLog) => {
+      setLogs(prev => {
+        const next = [...prev, newLog];
+        if (next.length > 200) next.shift();
+        return next;
+      });
+    });
+
+    return () => {
+      // no unsubscribe function exposed right now, but it's fine for this app lifetime
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (open && logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [logs, open]);
+
+  const copyLogs = () => {
+    const text = logs.map(l => `[${l.timestamp}] [${l.level.toUpperCase()}] ${l.message} ${l.meta ? JSON.stringify(l.meta) : ''}`).join('\\n');
+    navigator.clipboard.writeText(text);
+  };
+
+  if (!open) return null;
+
+  return (
+    <div style={{
+      position: 'absolute', top: 36, bottom: 0, left: 0, right: 0,
+      background: '#1e1e1e', color: '#d4d4d4', zIndex: 9999,
+      display: 'flex', flexDirection: 'column',
+      fontFamily: 'Consolas, monospace', fontSize: 12
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 12px', background: '#252526', borderBottom: '1px solid #000' }}>
+        <span style={{ fontWeight: 600 }}>Terminal de Logs</span>
+        <div style={{ display: 'flex', gap: 12 }}>
+          <button onClick={copyLogs} style={{ background: 'transparent', border: 'none', color: '#d4d4d4', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+            <Copy size={12} /> Copiar
+          </button>
+          <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: '#f87171', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
+            <X size={14} /> Fechar
+          </button>
+        </div>
+      </div>
+      <div style={{ flex: 1, overflowY: 'auto', padding: '8px 12px' }}>
+        {logs.map(log => (
+          <div key={log.id} style={{ marginBottom: 4, display: 'flex', gap: 8 }}>
+            <span style={{ color: '#569cd6', flexShrink: 0 }}>[{log.timestamp.split('T')[1].substring(0, 8)}]</span>
+            <span style={{
+              color: log.level === 'error' ? '#f48771' : log.level === 'warn' ? '#cca700' : '#4ec9b0',
+              fontWeight: 600, width: 45, flexShrink: 0
+            }}>
+              [{log.level.toUpperCase()}]
+            </span>
+            <span style={{ wordBreak: 'break-all' }}>
+              {log.message}
+              {log.meta && <span style={{ color: '#ce9178', marginLeft: 8 }}>{JSON.stringify(log.meta)}</span>}
+            </span>
+          </div>
+        ))}
+        <div ref={logsEndRef} />
+      </div>
+    </div>
+  );
+}
+
 // ── Root App ──────────────────────────────────────────────────
 export default function App() {
   const [screen, setScreen] = useState('login'); // login | accounts | main
@@ -1190,6 +1276,13 @@ export default function App() {
   const [selectedAccount, setSelectedAccount] = useState(null);
   const [tunnelUrl, setTunnelUrl] = useState('');
   const [loadingAuth, setLoadingAuth] = useState(true);
+  const [logsOpen, setLogsOpen] = useState(false);
+
+  useEffect(() => {
+    const toggleLogs = () => setLogsOpen(prev => !prev);
+    window.addEventListener('toggle-logs', toggleLogs);
+    return () => window.removeEventListener('toggle-logs', toggleLogs);
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -1285,6 +1378,7 @@ export default function App() {
           )}
         </>
       )}
+      <LogConsole open={logsOpen} onClose={() => setLogsOpen(false)} />
     </div>
   );
 }
