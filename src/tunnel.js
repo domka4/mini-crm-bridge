@@ -5,23 +5,25 @@ export function createPinggyTunnel(localPort) {
   return new Promise((resolve, reject) => {
     logger.info(`Iniciando Pinggy Tunnel na porta ${localPort}...`);
     // Pinggy provides a generic TCP tunnel
-    // ssh -p 443 -R0:localhost:8000 a@tcp.pinggy.io
+    // ssh -p 443 -R0:localhost:8000 tcp@a.pinggy.io
     const ssh = spawn('ssh', [
       '-p', '443',
       '-R0:localhost:' + localPort,
       '-o', 'StrictHostKeyChecking=no',
       '-o', 'ServerAliveInterval=30',
-      'a@tcp.pinggy.io'
+      'tcp@a.pinggy.io'
     ]);
 
     let resolved = false;
     let url = '';
 
+    const urlRegex = /([a-zA-Z0-9-]+\.pinggy\.(io|link):\d+)/;
+
     ssh.stdout.on('data', (data) => {
       const output = data.toString();
       logger.info(`Pinggy stdout: ${output}`);
       // Look for the URL, Pinggy typically prints it like: tcp.pinggy.io:xxxxx
-      const match = output.match(/tcp\.pinggy\.io:\d+/);
+      const match = output.match(urlRegex);
       if (match && !resolved) {
         resolved = true;
         url = match[0];
@@ -36,7 +38,7 @@ export function createPinggyTunnel(localPort) {
     ssh.stderr.on('data', (data) => {
       const output = data.toString();
       logger.warn(`Pinggy stderr: ${output}`);
-      const match = output.match(/tcp\.pinggy\.io:\d+/);
+      const match = output.match(urlRegex);
       if (match && !resolved) {
         resolved = true;
         url = match[0];
