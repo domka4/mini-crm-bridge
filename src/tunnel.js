@@ -1,68 +1,81 @@
-import { spawn } from 'node:child_process';
+import { Client } from 'ssh2';
 import { logger } from './logger.js';
+import { Socket } from 'net';
 
 export function createPinggyTunnel(localPort) {
   return new Promise((resolve, reject) => {
-    logger.info(`Iniciando Pinggy Tunnel na porta ${localPort}...`);
-    // Pinggy provides a generic TCP tunnel
-    // ssh -p 443 -R0:localhost:8000 tcp@a.pinggy.io
-    const ssh = spawn('ssh', [
-      '-p', '443',
-      '-R0:localhost:' + localPort,
-      '-o', 'StrictHostKeyChecking=no',
-      '-o', 'ServerAliveInterval=30',
-      'tcp@a.pinggy.io'
-    ]);
-
+    logger.info(`Iniciando Pinggy Tunnel via ssh2 na porta ${localPort}...`);
+    
+    const conn = new Client();
     let resolved = false;
     let url = '';
 
-    const urlRegex = /([a-zA-Z0-9-]+\.pinggy\.(io|link):\d+)/;
+    // Regex para pegar tcp://xxxx.pinggy.link:12345
+    const urlRegex = /tcp:\/\/[a-zA-Z0-9.-]+\.(pinggy-free\.link|pinggy\.(io|link)):\d+/;
 
-    ssh.stdout.on('data', (data) => {
-      const output = data.toString();
-      logger.info(`Pinggy stdout: ${output}`);
-      // Look for the URL, Pinggy typically prints it like: tcp.pinggy.io:xxxxx
-      const match = output.match(urlRegex);
-      if (match && !resolved) {
-        resolved = true;
-        url = match[0];
-        logger.info(`Tunnel conectado: ${url}`);
-        resolve({
-          url,
-          close: () => ssh.kill()
+    conn.on('ready', () => {
+      logger.info('SSH connection ready, requesting port forward...');
+      conn.forwardIn('127.0.0.1', 0, (err) => {
+        if (err) {
+          logger.error('Error forwarding remote port: ' + err.message);
+        }
+      });
+      
+      conn.shell({ term: 'xterm' }, (err, stream) => {
+        if (err) {
+          if (!resolved) reject(err);
+          return;
+        }
+
+        stream.on('data', (data) => {
+          const output = data.toString();
+          const match = output.match(urlRegex);
+          if (match && !resolved) {
+            resolved = true;
+            url = match[0].replace('tcp://', ''); // limpa prefixo para pegar só host:port
+            logger.info(`Tunnel conectado via ssh2: ${url}`);
+            resolve({
+              url,
+              close: () => conn.end()
+            });
+          }
         });
-      }
-    });
-
-    ssh.stderr.on('data', (data) => {
-      const output = data.toString();
-      logger.warn(`Pinggy stderr: ${output}`);
-      const match = output.match(urlRegex);
-      if (match && !resolved) {
-        resolved = true;
-        url = match[0];
-        logger.info(`Tunnel conectado: ${url}`);
-        resolve({
-          url,
-          close: () => ssh.kill()
-        });
-      }
-    });
-
-    ssh.on('close', (code) => {
-      logger.info(`Pinggy process close with code ${code}`);
+      });
+    }).on('tcp connection', (info, accept, reject) => {
+      const stream = accept();
+      const localSocket = new Socket();
+      localSocket.connect(localPort, '127.0.0.1', () => {
+        stream.pipe(localSocket).pipe(stream);
+      });
+      localSocket.on('error', (err) => {
+        logger.error('Local socket errored: ' + err.message);
+        stream.end();
+      });
+    }).on('error', (err) => {
+      logger.error('SSH Error: ' + err.message);
       if (!resolved) {
-        reject(new Error(`SSH tunnel failed to start with code ${code}`));
+        reject(err);
       }
+    }).on('close', () => {
+      logger.info('SSH connection closed');
+      if (!resolved) {
+        reject(new Error('SSH connection closed unexpectedly'));
+      }
+    }).connect({
+      host: 'a.pinggy.io',
+      port: 443,
+      username: 'tcp',
+      password: 'a',
+      tryKeyboard: true,
+      readyTimeout: 15000
     });
     
-    // Safety timeout
+    // Timeout global
     setTimeout(() => {
       if (!resolved) {
         logger.error('Pinggy tunnel timeout after 15s');
-        ssh.kill();
-        reject(new Error('Timeout waiting for tunnel URL from Pinggy'));
+        conn.end();
+        reject(new Error('Timeout ao conectar ao Pinggy tunnel'));
       }
     }, 15000);
   });

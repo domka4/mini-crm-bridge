@@ -107,7 +107,7 @@ async function ensureTunnel() {
     });
   }
 
-  // Abre o tunnel via ssh com timeout maior
+  // Abre o tunnel via ssh2 com timeout maior
   try {
     tunnel = await createPinggyTunnel(8000);
   } catch (err) {
