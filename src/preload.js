@@ -1,20 +1,24 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-contextBridge.exposeInMainWorld('bridgeAPI', {
-  login: (credentials) => ipcRenderer.invoke('login', credentials),
-  selectAccount: (data) => ipcRenderer.invoke('select-account', data),
-  startProxy: () => ipcRenderer.invoke('start-proxy'),
-  stopProxy: () => ipcRenderer.invoke('stop-proxy'),
-  listInstances: () => ipcRenderer.invoke('list-instances'),
-  connectInstance: (data) => ipcRenderer.invoke('connect-instance', data),
-  deleteInstance: (data) => ipcRenderer.invoke('delete-instance', data),
-  checkInstanceStatus: (data) => ipcRenderer.invoke('check-instance-status', data),
-  minimizeToTray: () => ipcRenderer.send('minimize-to-tray'),
-  closeApp: () => ipcRenderer.send('close-app'),
-  saveAuth: (data) => ipcRenderer.invoke('save-auth', data),
-  loadAuth: () => ipcRenderer.invoke('load-auth'),
-  clearAuth: () => ipcRenderer.invoke('clear-auth'),
-  showNotification: (title, body) => ipcRenderer.send('show-notification', { title, body }),
-  getLogs: () => ipcRenderer.invoke('get-logs'),
-  onLog: (callback) => ipcRenderer.on('new-log', (_event, log) => callback(log)),
+// Única porta entre a tela e o processo principal. A tela não acessa Node, arquivos nem a rede.
+
+function ouvir(canal, fn) {
+  const h = (_e, dado) => fn(dado);
+  ipcRenderer.on(canal, h);
+  return () => ipcRenderer.removeListener(canal, h);
+}
+
+contextBridge.exposeInMainWorld('bridge', {
+  estado: () => ipcRenderer.invoke('estado'),
+  parear: (codigo, nome) => ipcRenderer.invoke('parear', codigo, nome),
+  adicionarNumero: (rotulo) => ipcRenderer.invoke('adicionar-numero', rotulo),
+  conectarNumero: (id) => ipcRenderer.invoke('conectar-numero', id),
+  desconectarNumero: (id) => ipcRenderer.invoke('desconectar-numero', id),
+  desparear: () => ipcRenderer.invoke('desparear'),
+  logs: () => ipcRenderer.invoke('logs'),
+  abrirCrm: () => ipcRenderer.invoke('abrir-crm'),
+  procurarAtualizacao: () => ipcRenderer.invoke('procurar-atualizacao'),
+  preferencias: (novas) => ipcRenderer.invoke('preferencias', novas),
+  aoMudarEstado: (fn) => ouvir('estado', fn),
+  aoNovoLog: (fn) => ouvir('new-log', fn),
 });

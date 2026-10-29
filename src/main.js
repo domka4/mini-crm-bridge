@@ -1,430 +1,182 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, Notification } from 'electron';
-import path from 'node:path';
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, nativeTheme, shell } from 'electron';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import started from 'electron-squirrel-startup';
-import { Server as ProxyChainServer } from 'proxy-chain';
-import { createPinggyTunnel } from './tunnel.js';
 import { logger, setMainWindowForLogs, getLogs } from './logger.js';
+import { ICONE_BANDEJA } from './main/icone.js';
+import { CRM_URL } from './main/config.js';
+import * as cofre from './main/cofre.js';
+import * as servico from './main/servico.js';
+import * as executor from './main/executor.js';
+import { iniciarAtualizacoes, estadoAtualizacao, definirBeta, verificarAgora } from './main/atualizacao.js';
 
-// ---------------------------------------------------------------------------
-// Estado global
-// ---------------------------------------------------------------------------
-let mainWindow, tray = null, proxyServer = null, tunnel = null;
-let currentAccountId = null, currentAccessToken = null;
+// Mini CRM Bridge 2.0 (docs/08): o WhatsApp dos números da conta roda neste PC,
+// na mesma rede do celular, e conversa com o Mini CRM só por conexões de saída.
 
-const CRM_API_URL = process.env.VITE_CRM_API_URL || 'https://donovanfeitosa.linkinn.bio';
-
-// ---------------------------------------------------------------------------
-// Squirrel (instalador Windows)
-// ---------------------------------------------------------------------------
 if (started) app.quit();
 
-// ---------------------------------------------------------------------------
-// Janela principal
-// ---------------------------------------------------------------------------
-function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 420,
-    height: 680,
-    resizable: false,
-    frame: false,
-    titleBarStyle: 'hidden',
-    backgroundColor: '#0f172a',
+let janela = null;
+let bandeja = null;
+let saindo = false;
+const PREFERENCIAS_PADRAO = { iniciarComWindows: true, beta: false };
+
+function preferencias() {
+  return { ...PREFERENCIAS_PADRAO, ...(cofre.ler('preferencias') || {}) };
+}
+
+function aplicarInicioComWindows(ligar) {
+  if (!app.isPackaged) return;
+  app.setLoginItemSettings({ openAtLogin: !!ligar, args: ['--oculto'] });
+}
+
+function estadoCompleto() {
+  return { ...servico.obterEstado(), atualizacao: estadoAtualizacao(), preferencias: preferencias(), nomePc: os.hostname() };
+}
+
+function enviarEstado() {
+  if (janela && !janela.isDestroyed()) janela.webContents.send('estado', estadoCompleto());
+  atualizarBandeja();
+}
+
+function mostrarJanela() {
+  if (!janela) return;
+  if (janela.isMinimized()) janela.restore();
+  janela.show();
+  janela.focus();
+}
+
+function criarJanela() {
+  janela = new BrowserWindow({
+    width: 460,
+    height: 760,
+    minWidth: 400,
+    minHeight: 560,
+    show: false,
+    title: 'Mini CRM Bridge',
+    icon: nativeImage.createFromDataURL(ICONE_BANDEJA),
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#121411' : '#F4F5F3', // mesmo fundo da tela, sem piscar
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
     },
   });
 
-  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
-  } else {
-    mainWindow.loadFile(
-      path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
-    );
-  }
+  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) janela.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
+  else janela.loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
 
-  mainWindow.on('close', (e) => {
-    if (!app.isQuiting) {
-      e.preventDefault();
-      mainWindow.hide();
-    }
+  // links externos abrem no navegador; a janela do Bridge nunca navega para fora
+  janela.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://')) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  janela.webContents.on('will-navigate', (e) => e.preventDefault());
+
+  janela.once('ready-to-show', () => {
+    if (!process.argv.includes('--oculto')) janela.show();
+  });
+  janela.on('close', (e) => {
+    if (saindo) return;
+    e.preventDefault();
+    janela.hide(); // fechar a janela não para o WhatsApp; o Bridge continua na bandeja
   });
 
-  setMainWindowForLogs(mainWindow);
+  setMainWindowForLogs(janela);
 }
 
-// ---------------------------------------------------------------------------
-// System Tray
-// ---------------------------------------------------------------------------
-function createTray() {
-  try {
-    // Resolve o caminho do ícone tanto em dev quanto em prod
-    const iconPath = app.isPackaged
-      ? path.join(process.resourcesPath, 'assets', 'icon.png')
-      : path.join(__dirname, '..', 'assets', 'icon.png');
-    tray = new Tray(iconPath);
-
-    const contextMenu = Menu.buildFromTemplate([
-      {
-        label: 'Mostrar',
-        click: () => {
-          mainWindow.show();
-          mainWindow.focus();
-        },
-      },
-      {
-        label: 'Sair',
-        click: () => {
-          app.isQuiting = true;
-          app.quit();
-        },
-      },
-    ]);
-
-    tray.setToolTip('Mini CRM Bridge');
-    tray.setContextMenu(contextMenu);
-
-    tray.on('double-click', () => {
-      mainWindow.show();
-      mainWindow.focus();
-    });
-  } catch {
-    // Ícone não encontrado – ignora silenciosamente
-  }
+function rotuloDaBandeja() {
+  const e = servico.obterEstado();
+  if (!e.pareado) return 'Mini CRM Bridge: não pareado';
+  const conectados = e.numeros.filter((n) => n.estado === 'conectado').length;
+  return `Mini CRM Bridge: ${conectados} de ${e.numeros.length} número(s) conectado(s)`;
 }
 
-// ---------------------------------------------------------------------------
-// Helper – garantir que o túnel está ativo
-// ---------------------------------------------------------------------------
-async function ensureTunnel() {
-  if (tunnel && tunnel.url) return tunnel;
-
-  // Cria o servidor proxy local na porta 8000
-  if (!proxyServer) {
-    proxyServer = new ProxyChainServer({ port: 8000 });
-    await new Promise((resolve, reject) => {
-      proxyServer.listen((err) => (err ? reject(err) : resolve()));
-    });
-  }
-
-  // Abre o tunnel via ssh2 com timeout maior
-  try {
-    tunnel = await createPinggyTunnel(8000);
-  } catch (err) {
-    throw new Error('Falha ao conectar túnel TCP: ' + err.message);
-  }
-
-  // Atualiza as instâncias no backend com as informações do proxy
-  if (currentAccountId && currentAccessToken) {
-    const tunnelHost = tunnel.url.split(':')[0];
-    const tunnelPort = tunnel.url.split(':')[1];
-    const proxyPass = new Date().toISOString();
-    
-    await fetch(`${CRM_API_URL}/api/crm/wa/proxy`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${currentAccessToken}` },
-      body: JSON.stringify({
-        account_id: currentAccountId,
-        enabled: true,
-        proxy_host: tunnelHost,
-        proxy_port: tunnelPort,
-        proxy_user: 'bridge_online',
-        proxy_pass: proxyPass
-      })
-    }).catch(err => logger.error('Erro ao atualizar proxy da instancia', { error: err.message }));
-  }
-
-  return tunnel;
+function atualizarBandeja() {
+  if (bandeja) bandeja.setToolTip(rotuloDaBandeja());
 }
 
-// ---------------------------------------------------------------------------
-// App pronto
-// ---------------------------------------------------------------------------
-const gotTheLock = app.requestSingleInstanceLock();
+function criarBandeja() {
+  bandeja = new Tray(nativeImage.createFromDataURL(ICONE_BANDEJA));
+  bandeja.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Abrir o Bridge', click: mostrarJanela },
+    { label: 'Abrir o Mini CRM', click: () => shell.openExternal(CRM_URL + '/crm') },
+    { type: 'separator' },
+    { label: 'Sair (o WhatsApp para de funcionar no CRM)', click: () => { saindo = true; app.quit(); } },
+  ]));
+  bandeja.on('click', mostrarJanela);
+  atualizarBandeja();
+}
 
-if (!gotTheLock) {
+/** O Bridge 1.x guardava o token da conta em texto puro (achado P0-10). Some com ele. */
+function limparBridgeAntigo() {
+  try { fs.rmSync(path.join(app.getPath('appData'), 'mini-crm-bridge', 'auth.json'), { force: true }); } catch (_) {}
+}
+
+// IPC: cada canal devolve { ok, dados } ou { ok: false, erro } para a tela
+function tratar(nome, fn) {
+  ipcMain.handle(nome, async (_e, ...args) => {
+    try {
+      return { ok: true, dados: await fn(...args) };
+    } catch (e) {
+      logger.warn(`${nome}: ${e.message}`);
+      return { ok: false, erro: e.message };
+    }
+  });
+}
+
+tratar('estado', () => estadoCompleto());
+tratar('parear', (codigo, nome) => servico.parear(String(codigo || ''), String(nome || os.hostname()).slice(0, 60)));
+tratar('adicionar-numero', (rotulo) => servico.adicionarNumero(String(rotulo || '').slice(0, 40)));
+tratar('conectar-numero', (id) => servico.conectarNumero(id));
+tratar('desconectar-numero', (id) => servico.desconectarNumero(id));
+tratar('desparear', () => servico.desparear());
+tratar('logs', () => getLogs());
+tratar('abrir-crm', () => shell.openExternal(CRM_URL + '/crm'));
+tratar('procurar-atualizacao', () => verificarAgora());
+tratar('preferencias', (novas = {}) => {
+  const atuais = preferencias();
+  const p = {
+    iniciarComWindows: typeof novas.iniciarComWindows === 'boolean' ? novas.iniciarComWindows : atuais.iniciarComWindows,
+    beta: typeof novas.beta === 'boolean' ? novas.beta : atuais.beta,
+  };
+  cofre.salvar('preferencias', p);
+  aplicarInicioComWindows(p.iniciarComWindows);
+  if (p.beta !== atuais.beta) definirBeta(p.beta);
+  enviarEstado();
+  return p;
+});
+
+if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', (event, commandLine, workingDirectory) => {
-    // AlguÃ©m tentou rodar uma segunda instÃ¢ncia, foca na nossa janela original
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      if (!mainWindow.isVisible()) mainWindow.show();
-      mainWindow.focus();
-    }
-  });
+  app.on('second-instance', mostrarJanela);
 
-  app.whenReady().then(() => {
-    createWindow();
-    createTray();
+  app.whenReady().then(async () => {
+    app.setAppUserModelId('com.minicrm.bridge');
+    limparBridgeAntigo();
+    criarJanela();
+    criarBandeja();
+    const prefs = preferencias();
+    aplicarInicioComWindows(prefs.iniciarComWindows);
+
+    servico.quandoMudar(enviarEstado);
+    iniciarAtualizacoes({
+      beta: prefs.beta,
+      seguroReiniciar: () => executor.enviosPendentes() === 0,
+      quandoMudar: enviarEstado,
+    });
+    logger.info(`Mini CRM Bridge ${app.getVersion()} iniciado.`);
+    await servico.iniciar();
   });
 }
 
-app.on('window-all-closed', (e) => {
-  e.preventDefault();
+app.on('before-quit', () => {
+  saindo = true;
+  servico.encerrar();
 });
 
-// ---------------------------------------------------------------------------
-// IPC Handlers
-// ---------------------------------------------------------------------------
-
-ipcMain.handle('save-auth', async (event, data) => {
-  const authPath = path.join(app.getPath('userData'), 'auth.json');
-  fs.writeFileSync(authPath, JSON.stringify(data));
-  return true;
-});
-
-ipcMain.handle('load-auth', async () => {
-  const authPath = path.join(app.getPath('userData'), 'auth.json');
-  if (fs.existsSync(authPath)) {
-    try { return JSON.parse(fs.readFileSync(authPath, 'utf8')); } catch(e){}
-  }
-  return null;
-});
-
-ipcMain.handle('clear-auth', async () => {
-  const authPath = path.join(app.getPath('userData'), 'auth.json');
-  if (fs.existsSync(authPath)) fs.unlinkSync(authPath);
-  return true;
-});
-
-ipcMain.on('show-notification', (event, { title, body }) => {
-  new Notification({
-    title,
-    body,
-    icon: app.isPackaged ? path.join(process.resourcesPath, 'assets', 'icon.png') : path.join(__dirname, '..', 'assets', 'icon.png')
-  }).show();
-});
-
-// 1. Login -------------------------------------------------------------------
-ipcMain.handle('login', async (_event, { email, password }) => {
-  try {
-    const response = await fetch(`${CRM_API_URL}/api/bridge/auth`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password })
-    });
-
-    const data = await response.json();
-    if (!response.ok) return { success: false, error: data.error || 'Erro na autenticação' };
-
-    currentAccessToken = data.token;
-    return { success: true, email: data.email, accounts: data.accounts };
-  } catch (err) {
-    return { success: false, error: err.message || 'Erro de conexão no login.' };
-  }
-});
-
-// 2. Selecionar conta --------------------------------------------------------
-ipcMain.handle('select-account', async (_event, { account_id }) => {
-  try {
-    currentAccountId = account_id;
-    logger.info(`Conta selecionada: ${account_id}`);
-    
-    // Não vamos bloquear a UI com o proxy no momento da seleção.
-    // Retornamos sucesso e o frontend iniciará o proxy (se precisar) async.
-    return { success: true, tunnelUrl: null };
-  } catch (err) {
-    logger.error('Erro ao selecionar conta', { error: err.message });
-    return { success: false, error: err.message || 'Erro ao selecionar conta.' };
-  }
-});
-
-// 3. Iniciar proxy -----------------------------------------------------------
-ipcMain.handle('start-proxy', async () => {
-  try {
-    await ensureTunnel();
-    return { success: true, url: tunnel.url };
-  } catch (err) {
-    return { success: false, error: err.message || 'Erro ao iniciar proxy.' };
-  }
-});
-
-// 4. Parar proxy -------------------------------------------------------------
-ipcMain.handle('stop-proxy', async () => {
-  try {
-    if (tunnel) {
-      tunnel.close();
-      tunnel = null;
-    }
-
-    if (proxyServer) {
-      await new Promise((resolve) => proxyServer.close(resolve));
-      proxyServer = null;
-    }
-
-    // Atualiza backend sinalizando que o bridge está offline e desativando proxy nas instâncias
-    if (currentAccountId && currentAccessToken) {
-      await fetch(`${CRM_API_URL}/api/crm/wa/proxy`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${currentAccessToken}` },
-        body: JSON.stringify({
-          account_id: currentAccountId,
-          enabled: false
-        })
-      }).catch(err => logger.error('Erro ao desativar proxy na instancia', { error: err.message }));
-    }
-
-    return { success: true };
-  } catch (err) {
-    return { success: false, error: err.message || 'Erro ao parar proxy.' };
-  }
-});
-
-// 5. Listar instâncias -------------------------------------------------------
-ipcMain.handle('list-instances', async () => {
-  try {
-    if (!currentAccountId || !currentAccessToken) {
-      return { success: false, error: 'Nenhuma conta selecionada.' };
-    }
-
-    const response = await fetch(`${CRM_API_URL}/api/bridge/instances?account_id=${currentAccountId}`, {
-      headers: { Authorization: `Bearer ${currentAccessToken}` }
-    });
-    
-    const data = await response.json();
-    if (!response.ok) return { success: false, error: data.error || 'Erro ao listar instâncias' };
-
-    return { success: true, instancias: data.instances };
-  } catch (err) {
-    return { success: false, error: err.message || 'Erro de conexão ao listar instâncias.' };
-  }
-});
-
-// 6. Conectar instância ------------------------------------------------------
-ipcMain.handle('connect-instance', async (_event, { instance_name, phone_number }) => {
-  try {
-    // Garante que o túnel está ativo
-    await ensureTunnel();
-
-    const tunnelHost = tunnel.url.split(':')[0];
-    const tunnelPort = tunnel.url.split(':')[1];
-
-    const response = await fetch(`${CRM_API_URL}/api/crm/wa/conectar`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${currentAccessToken}`,
-      },
-      body: JSON.stringify({
-        account_id: currentAccountId,
-        is_oficial: false,
-        instance_name,
-        phone_number,
-        proxy_host: tunnelHost,
-        proxy_port: tunnelPort,
-        proxy_user: '',
-        proxy_pass: '',
-        proxy_type: 'local',
-      }),
-    });
-
-    const responseBody = await response.json();
-
-    if (response.ok) {
-      return {
-        success: true,
-        qrcode: responseBody.qrcode,
-        instance: responseBody.instance,
-        estado: responseBody.estado,
-      };
-    }
-
-    return { success: false, error: responseBody.error || 'Erro na API' };
-  } catch {
-    return {
-      success: false,
-      error: 'Não foi possível conectar à API. Verifique sua conexão.',
-    };
-  }
-});
-
-// 7. Deletar instância -------------------------------------------------------
-ipcMain.handle('delete-instance', async (_event, { instance_id }) => {
-  try {
-    if (!currentAccountId || !currentAccessToken) {
-      return { success: false, error: 'Nenhuma conta selecionada.' };
-    }
-
-    const response = await fetch(`${CRM_API_URL}/api/bridge/instances?account_id=${currentAccountId}&instance_id=${instance_id}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${currentAccessToken}` }
-    });
-    
-    const data = await response.json();
-    if (!response.ok) return { success: false, error: data.error || 'Erro ao deletar instância' };
-
-    return { success: true };
-  } catch (err) {
-    return { success: false, error: err.message || 'Erro de conexão ao deletar instância.' };
-  }
-});
-
-// 8. Verificar status da instância -------------------------------------------
-ipcMain.handle('check-instance-status', async (_event, { instance_name }) => {
-  try {
-    if (!currentAccountId || !currentAccessToken) {
-      return { success: false, error: 'Nenhuma conta selecionada.' };
-    }
-
-    const response = await fetch(`${CRM_API_URL}/api/bridge/instances?account_id=${currentAccountId}&instance_name=${instance_name}`, {
-      headers: { Authorization: `Bearer ${currentAccessToken}` }
-    });
-    
-    const data = await response.json();
-    if (!response.ok) return { success: false, error: data.error || 'Erro ao verificar status' };
-
-    if (!data.instances || data.instances.length === 0) {
-      return { success: false, error: 'Instância não encontrada' };
-    }
-    
-    return { success: true, status: data.instances[0].status, instance: data.instances[0] };
-  } catch (err) {
-    return { success: false, error: err.message || 'Erro de conexão ao verificar status.' };
-  }
-});
-
-// 9. Minimizar para tray -----------------------------------------------------
-ipcMain.on('minimize-to-tray', () => {
-  if (mainWindow) mainWindow.hide();
-});
-
-// 10. Fechar aplicação -------------------------------------------------------
-ipcMain.on('close-app', () => {
-  app.isQuiting = true;
-  app.quit();
-});
-// 11. Reiniciar instancia -----------------------------------------------------
-ipcMain.handle('restart-instance', async (_event, { instance_name }) => {
-  try {
-    const response = await fetch(`${CRM_API_URL}/api/crm/wa/reconnect`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${currentAccessToken}` },
-      body: JSON.stringify({ account_id: currentAccountId, instance_name, action: 'restart' })
-    });
-    const responseBody = await response.json();
-    return response.ok ? { success: true } : { success: false, error: responseBody.error || 'Erro ao reiniciar' };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-});
-
-// 12. Deslogar instancia ------------------------------------------------------
-ipcMain.handle('logout-instance', async (_event, { instance_name }) => {
-  try {
-    const response = await fetch(`${CRM_API_URL}/api/crm/wa/reconnect`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${currentAccessToken}` },
-      body: JSON.stringify({ account_id: currentAccountId, instance_name, action: 'logout' })
-    });
-    const responseBody = await response.json();
-    return response.ok ? { success: true } : { success: false, error: responseBody.error || 'Erro ao deslogar' };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-});
-
-// 13. Logs --------------------------------------------------------------------
-ipcMain.handle('get-logs', async () => {
-  return getLogs();
-});
+// o Bridge vive na bandeja: fechar a janela não encerra o app
+app.on('window-all-closed', () => {});
