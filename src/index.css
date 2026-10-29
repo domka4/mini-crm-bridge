@@ -146,6 +146,9 @@ button:disabled { cursor: default; opacity: .55; }
 .novo .linha input { flex: 1; min-width: 0; border: 1px solid var(--border); border-radius: 9px; padding: 8px 11px; background: var(--bg); outline: none; }
 .novo .linha input:focus { border-color: var(--t1); }
 .novo p { margin: 8px 0 0; font-size: 12px; color: var(--t2); }
+.novo .quem-ve { border: 0; padding: 0; margin: 10px 0 0; display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--t1); }
+.novo .quem-ve legend { width: 100%; padding: 0; margin-bottom: 4px; font-size: 12px; color: var(--t2); }
+.novo .quem-ve label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
 
 .rodape-fila { margin-top: 14px; color: var(--t2); font-size: 12.5px; display: flex; align-items: center; gap: 6px; }
 

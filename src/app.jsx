@@ -269,6 +269,7 @@ function Numero({ n }) {
 
 function NovoNumero({ aoFechar }) {
   const [rotulo, setRotulo] = useState('');
+  const [visibilidade, setVisibilidade] = useState('todos'); // quem vê as conversas no Mini CRM
   const [enviando, setEnviando] = useState(false);
   const [erro, setErro] = useState('');
 
@@ -278,7 +279,7 @@ function NovoNumero({ aoFechar }) {
     setEnviando(true);
     setErro('');
     try {
-      await chamar(api.adicionarNumero, rotulo.trim());
+      await chamar(api.adicionarNumero, rotulo.trim(), visibilidade);
       aoFechar();
     } catch (err) {
       setErro(amigavel(err));
@@ -294,7 +295,12 @@ function NovoNumero({ aoFechar }) {
         <button className="btn pri" type="submit" disabled={enviando}>{enviando && <Girando />}Gerar QR</button>
         <button className="btn" type="button" onClick={aoFechar} disabled={enviando}>Cancelar</button>
       </div>
-      {erro ? <p className="erro-campo" role="alert" style={{ margin: '8px 0 0' }}>{erro}</p> : <p>O QR aparece aqui em seguida. Use o celular do número que vai atender pelo CRM.</p>}
+      <fieldset className="quem-ve">
+        <legend>Quem vê as conversas no Mini CRM</legend>
+        <label><input type="radio" name="quem-ve" value="todos" checked={visibilidade === 'todos'} onChange={() => setVisibilidade('todos')} />Todo o projeto</label>
+        <label><input type="radio" name="quem-ve" value="dono" checked={visibilidade === 'dono'} onChange={() => setVisibilidade('dono')} />Só eu, para um WhatsApp pessoal</label>
+      </fieldset>
+      {erro ? <p className="erro-campo" role="alert" style={{ margin: '8px 0 0' }}>{erro}</p> : <p>O QR aparece aqui em seguida. Use o celular do número que vai atender pelo CRM. Dá para mudar quem vê as conversas depois, na tela Números do Mini CRM.</p>}
     </form>
   );
 }

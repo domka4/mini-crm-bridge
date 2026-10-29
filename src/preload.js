@@ -11,7 +11,7 @@ function ouvir(canal, fn) {
 contextBridge.exposeInMainWorld('bridge', {
   estado: () => ipcRenderer.invoke('estado'),
   parear: (codigo, nome) => ipcRenderer.invoke('parear', codigo, nome),
-  adicionarNumero: (rotulo) => ipcRenderer.invoke('adicionar-numero', rotulo),
+  adicionarNumero: (rotulo, visibilidade) => ipcRenderer.invoke('adicionar-numero', rotulo, visibilidade),
   conectarNumero: (id) => ipcRenderer.invoke('conectar-numero', id),
   desconectarNumero: (id) => ipcRenderer.invoke('desconectar-numero', id),
   desparear: () => ipcRenderer.invoke('desparear'),
