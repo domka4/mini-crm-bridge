@@ -38,6 +38,38 @@ const jidDe = (para) => (para.includes('@') ? para : `${para}@s.whatsapp.net`);
 const ritmoDe = (cmd) => (cmd.payload?.ritmo === 'conversa' ? 'conversa' : 'campanha');
 const INTERVALO_CONVERSA_S = [1.5, 4];
 
+// Celular brasileiro com e sem o nono dígito: o WhatsApp registra muitos números (DDD 31 em diante,
+// contas antigas) sem o 9, e o CRM costuma ter o contato salvo com ele.
+function variantesNumero(n) {
+  const d = String(n).replace(/\D/g, '');
+  const v = [d];
+  if (d.startsWith('55') && d.length === 13 && d[4] === '9') v.push(d.slice(0, 4) + d.slice(5));
+  if (d.startsWith('55') && d.length === 12 && /[6-9]/.test(d[4])) v.push(d.slice(0, 4) + '9' + d.slice(4));
+  return v;
+}
+
+const jidsConhecidos = new Map(); // número pedido -> { jid, em }
+const VALIDADE_JID_MS = 24 * 3600 * 1000;
+
+/**
+ * JID real de um telefone no WhatsApp (pergunta ao próprio WhatsApp, com e sem o nono dígito).
+ * Sem isso, a mensagem vai para um endereço que não existe e some sem erro. Grupo passa direto.
+ * @returns {Promise<string|null>} null quando o número não tem WhatsApp
+ */
+async function jidReal(sock, para) {
+  if (String(para).includes('@')) return para;
+  const c = jidsConhecidos.get(para);
+  if (c && Date.now() - c.em < VALIDADE_JID_MS) return c.jid;
+  for (const n of variantesNumero(para)) {
+    const [r] = (await sock.onWhatsApp(n)) || [];
+    if (r?.exists && r.jid) {
+      jidsConhecidos.set(para, { jid: r.jid, em: Date.now() });
+      return r.jid;
+    }
+  }
+  return null;
+}
+
 /** Telefone (JID) de um participante de grupo; em grupos com LID o número vem em phoneNumber. */
 function jidTelefone(p) {
   if (p?.phoneNumber) return p.phoneNumber;
@@ -129,7 +161,8 @@ async function processarFila(instanciaId, f) {
 async function enviarMensagem(cmd) {
   const p = cmd.payload;
   const sock = motor.socketConectado(cmd.instancia_id);
-  const jid = jidDe(p.para);
+  const jid = await jidReal(sock, p.para);
+  if (!jid) throw new Error('este número não tem WhatsApp');
 
   // "digitando…" proporcional ao tamanho do texto
   const { presenca_ms_por_caractere, presenca_max_ms } = config.ritmo;
@@ -156,6 +189,7 @@ async function enviarMensagem(cmd) {
 
   const msg = await sock.sendMessage(jid, conteudo);
   if (msg?.key?.id) motor.enviadosPeloBridge.add(msg.key.id);
+  logger.info(`Mensagem enviada para …${String(jid).split('@')[0].slice(-4)}${p.ritmo === 'conversa' ? '' : ' (campanha)'}.`);
   return { wa_id: msg?.key?.id || null };
 }
 
@@ -176,14 +210,18 @@ async function executar(cmd) {
         return { ok: true, resultado: await enviarMensagem(cmd) };
       case 'numero.validar': {
         const sock = motor.socketConectado(cmd.instancia_id);
-        const r = await sock.onWhatsApp(...p.numeros.map(jidDe));
-        const porNumero = new Map((r || []).map((x) => [String(x.jid).split('@')[0], x]));
-        return { ok: true, resultado: { numeros: p.numeros.map((n) => ({ numero: n, existe: !!porNumero.get(n)?.exists, jid: porNumero.get(n)?.jid || null })) } };
+        // um por vez: o WhatsApp devolve o JID real (às vezes sem o nono dígito), que não bate com o pedido
+        const numeros = [];
+        for (const n of p.numeros) {
+          const jid = await jidReal(sock, n);
+          numeros.push({ numero: n, existe: !!jid, jid });
+        }
+        return { ok: true, resultado: { numeros } };
       }
       case 'perfil.foto': {
         const sock = motor.socketConectado(cmd.instancia_id);
         let url = null;
-        try { url = await sock.profilePictureUrl(jidDe(p.numero), 'image'); } catch (_) {}
+        try { url = await sock.profilePictureUrl((await jidReal(sock, p.numero)) || jidDe(p.numero), 'image'); } catch (_) {}
         return { ok: true, resultado: { url } };
       }
       case 'grupos.sincronizar': {
