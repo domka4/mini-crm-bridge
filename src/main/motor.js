@@ -5,7 +5,8 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import { logger } from '../logger.js';
 import { usarSessaoCifrada } from './sessaoCifrada.js';
-import { canal, emitirEvento } from './canal.js';
+import { emitirEvento } from './canal.js';
+import * as midiaLocal from './midiaLocal.js';
 
 // Motor do WhatsApp do Mini CRM (docs/08 §3.1): uma sessão do Baileys por número, rodando neste PC,
 // na mesma rede do celular. Sem proxy, sem túnel, sem servidor Evolution.
@@ -100,8 +101,9 @@ export async function iniciar(instancia) {
     sock.ev.on('creds.update', s.sessao.salvarCreds);
     sock.ev.on('connection.update', (u) => tratarConexao(instancia, s, sock, u).catch((e) => logger.error(`conexão ${s.rotulo}: ${e.message}`)));
     sock.ev.on('messages.upsert', ({ messages, type }) => {
-      if (type !== 'notify') return;
-      for (const m of messages) tratarMensagem(instancia.id, s, m).catch((e) => logger.warn(`mensagem não processada: ${e.message}`));
+      // notify = ao vivo; append = chegou enquanto o Bridge estava fechado (o CRM ignora repetidas pelo wa_id)
+      if (type !== 'notify' && type !== 'append') return;
+      for (const m of messages) tratarMensagem(instancia.id, s, m, type).catch((e) => logger.warn(`mensagem não processada: ${e.message}`));
     });
     sock.ev.on('messages.update', (lista) => {
       for (const { key, update } of lista) {
@@ -182,52 +184,71 @@ async function tratarConexao(instancia, s, sock, u) {
 }
 
 function conteudoDe(mensagem) {
-  const m = mensagem?.ephemeralMessage?.message || mensagem?.viewOnceMessage?.message || mensagem?.viewOnceMessageV2?.message || mensagem;
+  // tira os envelopes (temporária, visualização única, editada, documento com legenda…)
+  const m = B.normalizeMessageContent ? B.normalizeMessageContent(mensagem) : mensagem;
   if (!m) return null;
   if (m.protocolMessage || m.reactionMessage || (m.senderKeyDistributionMessage && Object.keys(m).length === 1)) return null;
   if (m.conversation) return { tipo: 'texto', texto: m.conversation };
   if (m.extendedTextMessage?.text) return { tipo: 'texto', texto: m.extendedTextMessage.text };
-  if (m.imageMessage) return { tipo: 'imagem', texto: m.imageMessage.caption, mime: m.imageMessage.mimetype, nome: 'imagem.jpg' };
-  if (m.videoMessage) return { tipo: 'video', texto: m.videoMessage.caption, mime: m.videoMessage.mimetype, nome: 'video.mp4' };
+  if (m.imageMessage) return { tipo: 'imagem', texto: m.imageMessage.caption, mime: m.imageMessage.mimetype, nome: 'imagem.jpg', miniatura: m.imageMessage.jpegThumbnail };
+  if (m.videoMessage) return { tipo: 'video', texto: m.videoMessage.caption, mime: m.videoMessage.mimetype, nome: 'video.mp4', miniatura: m.videoMessage.jpegThumbnail };
   if (m.audioMessage) return { tipo: 'audio', mime: m.audioMessage.mimetype, nome: 'audio.ogg' };
-  if (m.documentMessage) return { tipo: 'documento', texto: m.documentMessage.caption, mime: m.documentMessage.mimetype, nome: m.documentMessage.fileName || 'documento' };
+  if (m.documentMessage) return { tipo: 'documento', texto: m.documentMessage.caption, mime: m.documentMessage.mimetype, nome: m.documentMessage.fileName || 'documento', miniatura: m.documentMessage.jpegThumbnail };
   if (m.stickerMessage) return { tipo: 'figurinha', mime: m.stickerMessage.mimetype, nome: 'figurinha.webp' };
   return { tipo: 'outro' };
 }
 
-/** JID de telefone do contato; mensagens com identificador @lid são resolvidas para o número. */
+/**
+ * JID de telefone do contato. Conversas no modo novo do WhatsApp (@lid) são resolvidas para o número:
+ * na recebida, o WhatsApp manda o número do remetente junto (remoteJidAlt); na enviada pelo celular,
+ * esse campo é o NOSSO número, então o contato sai do mapa LID → número do próprio Baileys.
+ */
 async function jidDoContato(s, key) {
-  let jid = key.remoteJid;
-  if (jid && jid.endsWith('@lid')) {
-    jid = key.remoteJidAlt || key.senderPn || null;
-    if (!jid) {
-      try { jid = await s.sock?.signalRepository?.lidMapping?.getPNForLID?.(key.remoteJid); } catch (_) { jid = null; }
-    }
-  }
-  return jid ? B.jidNormalizedUser(jid) : null;
+  const r = key.remoteJid || '';
+  if (r.endsWith('@s.whatsapp.net')) return B.jidNormalizedUser(r);
+  if (!r.endsWith('@lid')) return null;
+  if (!key.fromMe && String(key.remoteJidAlt || '').endsWith('@s.whatsapp.net')) return B.jidNormalizedUser(key.remoteJidAlt);
+  try {
+    const pn = await s.sock?.signalRepository?.lidMapping?.getPNForLID?.(r);
+    if (pn) return B.jidNormalizedUser(pn);
+  } catch (_) {}
+  return null;
 }
 
-async function tratarMensagem(instanciaId, s, m) {
+const ATRASO_MAXIMO_MS = 3 * 24 * 3600 * 1000; // mensagem guardada pelo WhatsApp: só as dos últimos 3 dias
+const finalDe = (jid) => String(jid).split('@')[0].slice(-4);
+
+async function tratarMensagem(instanciaId, s, m, lote = 'notify') {
   const key = m.key || {};
-  if (!m.message || key.remoteJid === 'status@broadcast' || B.isJidGroup(key.remoteJid)) return;
+  const r = key.remoteJid || '';
+  if (!r || r.endsWith('@broadcast') || B.isJidGroup(r) || r.endsWith('@newsletter')) return;
   if (key.fromMe && enviadosPeloBridge.has(key.id)) return;
+  if (lote === 'append' && Date.now() - Number(m.messageTimestamp || 0) * 1000 > ATRASO_MAXIMO_MS) return;
+  if (!m.message) {
+    if (m.messageStubType) logger.warn('Uma mensagem não pôde ser lida agora; o WhatsApp reenvia em seguida.');
+    return;
+  }
   const c = conteudoDe(m.message);
   if (!c) return;
   const jid = await jidDoContato(s, key);
-  if (!jid || !jid.endsWith('@s.whatsapp.net')) return;
+  if (!jid) {
+    logger.warn(`Mensagem ${key.fromMe ? 'enviada pelo celular' : 'recebida'} sem número identificável; não foi para o CRM.`);
+    return;
+  }
+  if (s.numero && jid === `${s.numero}@s.whatsapp.net`) return; // conversa consigo mesmo
 
-  let midia_url;
-  if (c.mime && !key.fromMe) {
+  // mídia fica neste PC; para o CRM vai só a miniatura (o arquivo sobe sob demanda, comando midia.copia)
+  let midia_local;
+  let miniatura;
+  if (c.mime) {
+    let buf;
     try {
-      const buf = await B.downloadMediaMessage(m, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: s.sock?.updateMediaMessage });
-      if (buf.length <= 16 * 1024 * 1024) {
-        const u = await canal.urlMidia({ instancia_id: instanciaId, nome: c.nome, tipo: c.mime, tamanho: buf.length });
-        const up = await fetch(u.url_upload, { method: 'PUT', headers: { 'Content-Type': c.mime }, body: buf });
-        if (up.ok) midia_url = u.url_publica;
-      }
+      buf = await B.downloadMediaMessage(m, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: s.sock?.updateMediaMessage });
+      midia_local = midiaLocal.guardar(instanciaId, key.id, c.mime, c.nome, buf);
     } catch (e) {
-      logger.warn(`Mídia recebida não foi salva: ${e.message}`);
+      logger.warn(`Mídia não foi salva neste PC: ${e.message}`);
     }
+    miniatura = midiaLocal.miniatura(c, buf);
   }
 
   emitirEvento({
@@ -239,10 +260,12 @@ async function tratarMensagem(instanciaId, s, m) {
       ...(m.pushName && !key.fromMe ? { nome: String(m.pushName).slice(0, 120) } : {}),
       ...(c.texto ? { texto: c.texto } : {}),
       midia_tipo: c.tipo,
-      ...(midia_url ? { midia_url } : {}),
+      ...(midia_local ? { midia_local } : {}),
+      ...(miniatura ? { miniatura } : {}),
       enviada_em: new Date(Number(m.messageTimestamp || Date.now() / 1000) * 1000).toISOString(),
     },
   });
+  logger.info(key.fromMe ? `Mensagem enviada pelo celular para …${finalDe(jid)}.` : `Mensagem recebida de …${finalDe(jid)}.`);
 }
 
 /** Socket conectado do número, ou erro claro. */

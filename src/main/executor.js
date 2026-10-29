@@ -1,10 +1,13 @@
 import { logger } from '../logger.js';
 import * as cofre from './cofre.js';
 import { canal, emitirEvento } from './canal.js';
+import fs from 'node:fs';
 import * as motor from './motor.js';
+import * as midiaLocal from './midiaLocal.js';
 
 // Execução dos comandos do CRM (docs/08 §4) com o ritmo anti-ban (docs/08 §6):
 // - envios: um de cada vez por número, intervalo aleatório entre eles, "digitando…" antes;
+// - resposta do chat (ritmo "conversa") passa na frente das campanhas e não espera o intervalo longo;
 // - pausa do número depois de falhas seguidas;
 // - comando já executado não é refeito: o resultado guardado é reenviado (o CRM pode reentregar).
 
@@ -34,6 +37,46 @@ const filas = new Map(); // instancia_id -> { itens: [], rodando, ultimoEnvio, f
 const espera = (ms) => new Promise((r) => setTimeout(r, ms));
 const aleatorio = (min, max) => min + Math.random() * (max - min);
 const jidDe = (para) => (para.includes('@') ? para : `${para}@s.whatsapp.net`);
+const ritmoDe = (cmd) => (cmd.payload?.ritmo === 'conversa' ? 'conversa' : 'campanha');
+const INTERVALO_CONVERSA_S = [1.5, 4];
+
+// Celular brasileiro com e sem o nono dígito: o WhatsApp registra muitos números (DDD 31 em diante,
+// contas antigas) sem o 9, e o CRM costuma ter o contato salvo com ele.
+function variantesNumero(n) {
+  const d = String(n).replace(/\D/g, '');
+  const v = [d];
+  if (d.startsWith('55') && d.length === 13 && d[4] === '9') v.push(d.slice(0, 4) + d.slice(5));
+  if (d.startsWith('55') && d.length === 12 && /[6-9]/.test(d[4])) v.push(d.slice(0, 4) + '9' + d.slice(4));
+  return v;
+}
+
+const jidsConhecidos = new Map(); // número pedido -> { jid, em }
+const VALIDADE_JID_MS = 24 * 3600 * 1000;
+
+/**
+ * JID real de um telefone no WhatsApp (pergunta ao próprio WhatsApp, com e sem o nono dígito).
+ * Sem isso, a mensagem vai para um endereço que não existe e some sem erro. Grupo passa direto.
+ * @returns {Promise<string|null>} null quando o número não tem WhatsApp
+ */
+async function jidReal(sock, para) {
+  if (String(para).includes('@')) return para;
+  const c = jidsConhecidos.get(para);
+  if (c && Date.now() - c.em < VALIDADE_JID_MS) return c.jid;
+  for (const n of variantesNumero(para)) {
+    const [r] = (await sock.onWhatsApp(n)) || [];
+    if (r?.exists && r.jid) {
+      jidsConhecidos.set(para, { jid: r.jid, em: Date.now() });
+      return r.jid;
+    }
+  }
+  return null;
+}
+
+/** Telefone (JID) de um participante de grupo; em grupos com LID o número vem em phoneNumber. */
+function jidTelefone(p) {
+  if (p?.phoneNumber) return p.phoneNumber;
+  return String(p?.id || '').endsWith('@s.whatsapp.net') ? p.id : null;
+}
 
 /** Recebe um comando do CRM. Envios entram na fila do número; o resto roda na hora. */
 export function receber(cmd) {
@@ -52,6 +95,11 @@ export function enviosPendentes() {
   return total;
 }
 
+/** Comandos que este PC já pegou e ainda não respondeu: o heartbeat renova o prazo deles no CRM. */
+export function comandosEmMaos() {
+  return [...emAndamento].slice(0, 200);
+}
+
 async function responder(id, saida) {
   try { await canal.resultado(id, saida.ok, saida.resultado, saida.erro); }
   catch (e) { logger.warn(`Resultado do comando ${id} não enviado: ${e.message}`); }
@@ -64,21 +112,39 @@ async function concluir(cmd, saida) {
 }
 
 function enfileirarEnvio(cmd) {
-  const f = filas.get(cmd.instancia_id) || { itens: [], rodando: false, ultimoEnvio: 0, falhas: 0, pausadoAte: 0 };
+  const f = filas.get(cmd.instancia_id) || { itens: [], rodando: false, ultimoEnvio: 0, falhas: 0, pausadoAte: 0, acordar: null };
   filas.set(cmd.instancia_id, f);
-  f.itens.push(cmd);
+  if (ritmoDe(cmd) === 'conversa') {
+    // na frente das campanhas, mantendo a ordem entre as conversas
+    const i = f.itens.findIndex((x) => ritmoDe(x) !== 'conversa');
+    if (i === -1) f.itens.push(cmd);
+    else f.itens.splice(i, 0, cmd);
+    f.acordar?.(); // interrompe a espera longa de uma campanha
+  } else {
+    f.itens.push(cmd);
+  }
   if (!f.rodando) processarFila(cmd.instancia_id, f);
+}
+
+/** Espera ms; se interrompível, uma conversa que chega acorda a fila antes. Devolve true se foi acordada. */
+function esperar(f, ms, interrompivel) {
+  return new Promise((fim) => {
+    const t = setTimeout(() => { f.acordar = null; fim(false); }, ms);
+    if (interrompivel) f.acordar = () => { clearTimeout(t); f.acordar = null; fim(true); };
+  });
 }
 
 async function processarFila(instanciaId, f) {
   f.rodando = true;
   while (f.itens.length) {
     const agora = Date.now();
-    if (f.pausadoAte > agora) await espera(f.pausadoAte - agora);
-    const { intervalo_min_s, intervalo_max_s } = config.ritmo;
-    const intervalo = aleatorio(intervalo_min_s, intervalo_max_s) * 1000;
-    const faltam = f.ultimoEnvio + intervalo - Date.now();
-    if (f.ultimoEnvio && faltam > 0) await espera(faltam);
+    if (f.pausadoAte > agora) { await esperar(f, f.pausadoAte - agora, false); continue; }
+    const proximo = f.itens[0];
+    const [min, max] = ritmoDe(proximo) === 'conversa'
+      ? INTERVALO_CONVERSA_S
+      : [config.ritmo.intervalo_min_s, config.ritmo.intervalo_max_s];
+    const faltam = f.ultimoEnvio + aleatorio(min, max) * 1000 - Date.now();
+    if (f.ultimoEnvio && faltam > 0 && await esperar(f, faltam, ritmoDe(proximo) !== 'conversa')) continue;
 
     const cmd = f.itens.shift();
     const saida = await executar(cmd);
@@ -97,7 +163,8 @@ async function processarFila(instanciaId, f) {
 async function enviarMensagem(cmd) {
   const p = cmd.payload;
   const sock = motor.socketConectado(cmd.instancia_id);
-  const jid = jidDe(p.para);
+  const jid = await jidReal(sock, p.para);
+  if (!jid) throw new Error('este número não tem WhatsApp');
 
   // "digitando…" proporcional ao tamanho do texto
   const { presenca_ms_por_caractere, presenca_max_ms } = config.ritmo;
@@ -110,12 +177,20 @@ async function enviarMensagem(cmd) {
     } catch (_) {}
   }
 
+  // mídia: baixa uma vez, envia e guarda a cópia neste PC (o CRM apaga a da nuvem depois do envio)
+  let arquivo = null;
+  if (p.tipo !== 'texto') {
+    const r = await fetch(p.midia_url, { signal: AbortSignal.timeout(60000) });
+    if (!r.ok) throw new Error(`não consegui baixar o arquivo do CRM (HTTP ${r.status})`);
+    arquivo = { buf: Buffer.from(await r.arrayBuffer()), mime: r.headers.get('content-type') || 'application/octet-stream' };
+  }
+
   let conteudo;
   if (p.tipo === 'texto') conteudo = { text: p.texto };
-  else if (p.tipo === 'imagem') conteudo = { image: { url: p.midia_url }, caption: p.texto };
-  else if (p.tipo === 'video') conteudo = { video: { url: p.midia_url }, caption: p.texto };
-  else if (p.tipo === 'audio') conteudo = { audio: { url: p.midia_url }, mimetype: 'audio/ogg; codecs=opus', ptt: true };
-  else if (p.tipo === 'documento') conteudo = { document: { url: p.midia_url }, fileName: p.nome_arquivo || 'arquivo', caption: p.texto };
+  else if (p.tipo === 'imagem') conteudo = { image: arquivo.buf, caption: p.texto };
+  else if (p.tipo === 'video') conteudo = { video: arquivo.buf, caption: p.texto };
+  else if (p.tipo === 'audio') conteudo = { audio: arquivo.buf, mimetype: 'audio/ogg; codecs=opus', ptt: true };
+  else if (p.tipo === 'documento') conteudo = { document: arquivo.buf, mimetype: arquivo.mime, fileName: p.nome_arquivo || 'arquivo', caption: p.texto };
 
   if (p.mencionar_todos && jid.endsWith('@g.us')) {
     const meta = await sock.groupMetadata(jid);
@@ -124,7 +199,14 @@ async function enviarMensagem(cmd) {
 
   const msg = await sock.sendMessage(jid, conteudo);
   if (msg?.key?.id) motor.enviadosPeloBridge.add(msg.key.id);
-  return { wa_id: msg?.key?.id || null };
+  let midia_local;
+  if (arquivo && msg?.key?.id) {
+    const nome = p.nome_arquivo || { imagem: 'imagem.jpg', video: 'video.mp4', audio: 'audio.ogg' }[p.tipo] || 'arquivo';
+    try { midia_local = midiaLocal.guardar(cmd.instancia_id, msg.key.id, arquivo.mime, nome, arquivo.buf); }
+    catch (e) { logger.warn(`Cópia da mídia enviada não ficou neste PC: ${e.message}`); }
+  }
+  logger.info(`Mensagem enviada para …${String(jid).split('@')[0].slice(-4)}${p.ritmo === 'conversa' ? '' : ' (campanha)'}.`);
+  return { wa_id: msg?.key?.id || null, ...(midia_local ? { midia_local } : {}) };
 }
 
 async function executar(cmd) {
@@ -144,25 +226,30 @@ async function executar(cmd) {
         return { ok: true, resultado: await enviarMensagem(cmd) };
       case 'numero.validar': {
         const sock = motor.socketConectado(cmd.instancia_id);
-        const r = await sock.onWhatsApp(...p.numeros.map(jidDe));
-        const porNumero = new Map((r || []).map((x) => [String(x.jid).split('@')[0], x]));
-        return { ok: true, resultado: { numeros: p.numeros.map((n) => ({ numero: n, existe: !!porNumero.get(n)?.exists, jid: porNumero.get(n)?.jid || null })) } };
+        // um por vez: o WhatsApp devolve o JID real (às vezes sem o nono dígito), que não bate com o pedido
+        const numeros = [];
+        for (const n of p.numeros) {
+          const jid = await jidReal(sock, n);
+          numeros.push({ numero: n, existe: !!jid, jid });
+        }
+        return { ok: true, resultado: { numeros } };
       }
       case 'perfil.foto': {
         const sock = motor.socketConectado(cmd.instancia_id);
         let url = null;
-        try { url = await sock.profilePictureUrl(jidDe(p.numero), 'image'); } catch (_) {}
+        try { url = await sock.profilePictureUrl((await jidReal(sock, p.numero)) || jidDe(p.numero), 'image'); } catch (_) {}
         return { ok: true, resultado: { url } };
       }
       case 'grupos.sincronizar': {
         const sock = motor.socketConectado(cmd.instancia_id);
         const todos = Object.values(await sock.groupFetchAllParticipating());
-        const meu = String(sock.user?.id || '').split(':')[0].split('@')[0];
+        const eu = [sock.user?.id, sock.user?.lid].filter(Boolean).map((j) => String(j).split(':')[0].split('@')[0]);
+        const souEu = (x) => [x.id, x.phoneNumber, x.lid].some((j) => j && eu.includes(String(j).split(':')[0].split('@')[0]));
         const grupos = todos.map((g) => ({
           jid: g.id,
           nome: g.subject || undefined,
           participantes: g.participants?.length ?? undefined,
-          sou_admin: !!g.participants?.find((x) => String(x.id).startsWith(meu) && x.admin),
+          sou_admin: !!g.participants?.find((x) => souEu(x) && x.admin),
         }));
         emitirEvento({ tipo: 'grupos_sincronizados', instancia_id: cmd.instancia_id, dados: { grupos } });
         return { ok: true, resultado: { total: grupos.length } };
@@ -170,11 +257,23 @@ async function executar(cmd) {
       case 'grupo.info': {
         const sock = motor.socketConectado(cmd.instancia_id);
         const g = await sock.groupMetadata(p.jid);
-        return { ok: true, resultado: { jid: g.id, nome: g.subject, descricao: g.desc || null, participantes: g.participants.map((x) => ({ id: x.id, admin: x.admin || null })) } };
+        // participante sem telefone visível (grupo em modo LID) não serve para virar contato: fica de fora
+        const participantes = g.participants.map((x) => ({ id: jidTelefone(x), admin: x.admin || null })).filter((x) => x.id);
+        return { ok: true, resultado: { jid: g.id, nome: g.subject, descricao: g.desc || null, participantes, ocultos: g.participants.length - participantes.length } };
       }
       case 'grupo.entrar': {
         const sock = motor.socketConectado(cmd.instancia_id);
         return { ok: true, resultado: { jid: await sock.groupAcceptInvite(p.convite) } };
+      }
+      case 'midia.copia': {
+        const caminho = midiaLocal.achar(cmd.instancia_id, p.wa_id);
+        if (!caminho) return { ok: false, erro: 'o arquivo não está mais neste computador' };
+        const buf = fs.readFileSync(caminho);
+        const up = await fetch(p.url_upload, {
+          method: 'PUT', headers: { 'Content-Type': p.mime || 'application/octet-stream' }, body: buf, signal: AbortSignal.timeout(120000),
+        });
+        if (!up.ok) throw new Error(`a nuvem recusou a cópia (HTTP ${up.status})`);
+        return { ok: true, resultado: { tamanho: buf.length } };
       }
       case 'grupo.atualizar': {
         const sock = motor.socketConectado(cmd.instancia_id);

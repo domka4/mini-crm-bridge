@@ -13,6 +13,7 @@ let estado = { pareado: false, conta: null, dispositivo: null, crmOnline: null, 
 let ativo = false;
 let aoMudar = () => {};
 let timerHeartbeat = null;
+const ausentes = new Map(); // número que sumiu da lista do CRM -> heartbeats seguidos sem ele
 
 const espera = (ms) => new Promise((r) => setTimeout(r, ms));
 function mudar(novo) { estado = { ...estado, ...novo }; aoMudar(obterEstado()); }
@@ -105,7 +106,7 @@ async function cicloHeartbeat() {
   if (!ativo) return;
   let proximo = 60;
   try {
-    const r = await canal.heartbeat(motor.estadosParaHeartbeat());
+    const r = await canal.heartbeat(motor.estadosParaHeartbeat(), executor.comandosEmMaos());
     executor.definirConfig(r.config);
     proximo = r.config?.heartbeat_s || 60;
     const bloqueado = compararVersoes(versaoApp(), r.config?.versao_minima || '0.0.0') < 0;
@@ -116,13 +117,27 @@ async function cicloHeartbeat() {
     mudar({ crmOnline: true, bloqueadoPorVersao: bloqueado, versaoMinima: r.config?.versao_minima || null });
 
     // números da conta ligados a este PC: reconecta os que já têm sessão, mostra os outros
-    const daConta = new Set();
-    for (const inst of r.instancias || []) {
-      daConta.add(inst.id);
-      if (motor.temSessaoSalva(inst.id)) await motor.iniciar(inst);
-      else motor.conhecer(inst);
+    if (Array.isArray(r.instancias)) {
+      const daConta = new Set();
+      for (const inst of r.instancias) {
+        daConta.add(inst.id);
+        ausentes.delete(inst.id);
+        if (motor.temSessaoSalva(inst.id)) await motor.iniciar(inst);
+        else motor.conhecer(inst);
+      }
+      // removido no CRM: depois de dois heartbeats seguidos sem ele, sai dos aparelhos conectados do celular
+      for (const n of motor.listarNumeros()) {
+        if (daConta.has(n.id)) continue;
+        const vezes = (ausentes.get(n.id) || 0) + 1;
+        ausentes.set(n.id, vezes);
+        if (vezes >= 2) {
+          ausentes.delete(n.id);
+          logger.info(`${n.rotulo}: removido no Mini CRM; desconectando deste PC.`);
+          await motor.desconectar(n.id);
+          motor.esquecer(n.id);
+        }
+      }
     }
-    for (const n of motor.listarNumeros()) if (!daConta.has(n.id)) motor.esquecer(n.id);
   } catch (e) {
     if (e.status === 401) return revogado();
     mudar({ crmOnline: false });
@@ -134,10 +149,12 @@ async function cicloHeartbeat() {
 
 async function cicloComandos() {
   while (ativo) {
-    // versão abaixo da mínima ou fila local cheia: não pega comando novo (o prazo do CRM é de 2 min)
-    if (estado.bloqueadoPorVersao || executor.enviosPendentes() > 1) { await espera(3000); continue; }
+    // versão abaixo da mínima: não pega comando novo
+    if (estado.bloqueadoPorVersao) { await espera(3000); continue; }
+    // campanha esperando na fila local: só pega o urgente (chat, grupos); o resto fica guardado no CRM
+    const ocupado = executor.enviosPendentes() > 1;
     try {
-      const r = await canal.comandos(25);
+      const r = await canal.comandos(25, ocupado ? 1 : 5, ocupado ? 10 : null);
       for (const cmd of r.comandos || []) executor.receber(cmd);
       if (r.comandos?.length) aoMudar(obterEstado());
     } catch (e) {
