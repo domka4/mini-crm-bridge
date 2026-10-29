@@ -37,7 +37,8 @@
       {
         "provider": "github",
         "owner": "domka4",
-        "repo": "mini-crm-bridge"
+        "repo": "mini-crm-bridge",
+        "releaseType": "release"
       }
     ]
   },
