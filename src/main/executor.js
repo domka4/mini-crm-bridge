@@ -5,6 +5,7 @@ import * as motor from './motor.js';
 
 // Execução dos comandos do CRM (docs/08 §4) com o ritmo anti-ban (docs/08 §6):
 // - envios: um de cada vez por número, intervalo aleatório entre eles, "digitando…" antes;
+// - resposta do chat (ritmo "conversa") passa na frente das campanhas e não espera o intervalo longo;
 // - pausa do número depois de falhas seguidas;
 // - comando já executado não é refeito: o resultado guardado é reenviado (o CRM pode reentregar).
 
@@ -34,6 +35,14 @@ const filas = new Map(); // instancia_id -> { itens: [], rodando, ultimoEnvio, f
 const espera = (ms) => new Promise((r) => setTimeout(r, ms));
 const aleatorio = (min, max) => min + Math.random() * (max - min);
 const jidDe = (para) => (para.includes('@') ? para : `${para}@s.whatsapp.net`);
+const ritmoDe = (cmd) => (cmd.payload?.ritmo === 'conversa' ? 'conversa' : 'campanha');
+const INTERVALO_CONVERSA_S = [1.5, 4];
+
+/** Telefone (JID) de um participante de grupo; em grupos com LID o número vem em phoneNumber. */
+function jidTelefone(p) {
+  if (p?.phoneNumber) return p.phoneNumber;
+  return String(p?.id || '').endsWith('@s.whatsapp.net') ? p.id : null;
+}
 
 /** Recebe um comando do CRM. Envios entram na fila do número; o resto roda na hora. */
 export function receber(cmd) {
@@ -52,6 +61,11 @@ export function enviosPendentes() {
   return total;
 }
 
+/** Comandos que este PC já pegou e ainda não respondeu: o heartbeat renova o prazo deles no CRM. */
+export function comandosEmMaos() {
+  return [...emAndamento].slice(0, 200);
+}
+
 async function responder(id, saida) {
   try { await canal.resultado(id, saida.ok, saida.resultado, saida.erro); }
   catch (e) { logger.warn(`Resultado do comando ${id} não enviado: ${e.message}`); }
@@ -64,21 +78,39 @@ async function concluir(cmd, saida) {
 }
 
 function enfileirarEnvio(cmd) {
-  const f = filas.get(cmd.instancia_id) || { itens: [], rodando: false, ultimoEnvio: 0, falhas: 0, pausadoAte: 0 };
+  const f = filas.get(cmd.instancia_id) || { itens: [], rodando: false, ultimoEnvio: 0, falhas: 0, pausadoAte: 0, acordar: null };
   filas.set(cmd.instancia_id, f);
-  f.itens.push(cmd);
+  if (ritmoDe(cmd) === 'conversa') {
+    // na frente das campanhas, mantendo a ordem entre as conversas
+    const i = f.itens.findIndex((x) => ritmoDe(x) !== 'conversa');
+    if (i === -1) f.itens.push(cmd);
+    else f.itens.splice(i, 0, cmd);
+    f.acordar?.(); // interrompe a espera longa de uma campanha
+  } else {
+    f.itens.push(cmd);
+  }
   if (!f.rodando) processarFila(cmd.instancia_id, f);
+}
+
+/** Espera ms; se interrompível, uma conversa que chega acorda a fila antes. Devolve true se foi acordada. */
+function esperar(f, ms, interrompivel) {
+  return new Promise((fim) => {
+    const t = setTimeout(() => { f.acordar = null; fim(false); }, ms);
+    if (interrompivel) f.acordar = () => { clearTimeout(t); f.acordar = null; fim(true); };
+  });
 }
 
 async function processarFila(instanciaId, f) {
   f.rodando = true;
   while (f.itens.length) {
     const agora = Date.now();
-    if (f.pausadoAte > agora) await espera(f.pausadoAte - agora);
-    const { intervalo_min_s, intervalo_max_s } = config.ritmo;
-    const intervalo = aleatorio(intervalo_min_s, intervalo_max_s) * 1000;
-    const faltam = f.ultimoEnvio + intervalo - Date.now();
-    if (f.ultimoEnvio && faltam > 0) await espera(faltam);
+    if (f.pausadoAte > agora) { await esperar(f, f.pausadoAte - agora, false); continue; }
+    const proximo = f.itens[0];
+    const [min, max] = ritmoDe(proximo) === 'conversa'
+      ? INTERVALO_CONVERSA_S
+      : [config.ritmo.intervalo_min_s, config.ritmo.intervalo_max_s];
+    const faltam = f.ultimoEnvio + aleatorio(min, max) * 1000 - Date.now();
+    if (f.ultimoEnvio && faltam > 0 && await esperar(f, faltam, ritmoDe(proximo) !== 'conversa')) continue;
 
     const cmd = f.itens.shift();
     const saida = await executar(cmd);
@@ -157,12 +189,13 @@ async function executar(cmd) {
       case 'grupos.sincronizar': {
         const sock = motor.socketConectado(cmd.instancia_id);
         const todos = Object.values(await sock.groupFetchAllParticipating());
-        const meu = String(sock.user?.id || '').split(':')[0].split('@')[0];
+        const eu = [sock.user?.id, sock.user?.lid].filter(Boolean).map((j) => String(j).split(':')[0].split('@')[0]);
+        const souEu = (x) => [x.id, x.phoneNumber, x.lid].some((j) => j && eu.includes(String(j).split(':')[0].split('@')[0]));
         const grupos = todos.map((g) => ({
           jid: g.id,
           nome: g.subject || undefined,
           participantes: g.participants?.length ?? undefined,
-          sou_admin: !!g.participants?.find((x) => String(x.id).startsWith(meu) && x.admin),
+          sou_admin: !!g.participants?.find((x) => souEu(x) && x.admin),
         }));
         emitirEvento({ tipo: 'grupos_sincronizados', instancia_id: cmd.instancia_id, dados: { grupos } });
         return { ok: true, resultado: { total: grupos.length } };
@@ -170,7 +203,9 @@ async function executar(cmd) {
       case 'grupo.info': {
         const sock = motor.socketConectado(cmd.instancia_id);
         const g = await sock.groupMetadata(p.jid);
-        return { ok: true, resultado: { jid: g.id, nome: g.subject, descricao: g.desc || null, participantes: g.participants.map((x) => ({ id: x.id, admin: x.admin || null })) } };
+        // participante sem telefone visível (grupo em modo LID) não serve para virar contato: fica de fora
+        const participantes = g.participants.map((x) => ({ id: jidTelefone(x), admin: x.admin || null })).filter((x) => x.id);
+        return { ok: true, resultado: { jid: g.id, nome: g.subject, descricao: g.desc || null, participantes, ocultos: g.participants.length - participantes.length } };
       }
       case 'grupo.entrar': {
         const sock = motor.socketConectado(cmd.instancia_id);

@@ -24,8 +24,10 @@ async function chamar(metodo, caminho, corpo, { timeoutMs = 20000 } = {}) {
 
 export const canal = {
   parear: (codigo, nome) => chamar('POST', '/api/crm/bridge/v2/parear', { codigo, nome, versao: versaoApp() }),
-  heartbeat: (instancias) => chamar('POST', '/api/crm/bridge/v2/heartbeat', { versao: versaoApp(), instancias }),
-  comandos: (espera, limite = 5) => chamar('GET', `/api/crm/bridge/v2/comandos?espera=${espera}&limite=${limite}`, undefined, { timeoutMs: (espera + 15) * 1000 }),
+  heartbeat: (instancias, comandos = []) => chamar('POST', '/api/crm/bridge/v2/heartbeat', { versao: versaoApp(), instancias, comandos }),
+  comandos: (espera, limite = 5, prioridadeMin = null) => chamar('GET',
+    `/api/crm/bridge/v2/comandos?espera=${espera}&limite=${limite}` + (prioridadeMin !== null ? `&prioridade_min=${prioridadeMin}` : ''),
+    undefined, { timeoutMs: (espera + 15) * 1000 }),
   resultado: (id, ok, resultado, erro) => chamar('POST', `/api/crm/bridge/v2/comandos/${id}/resultado`, { ok, resultado, erro }),
   criarNumero: (rotulo) => chamar('POST', '/api/crm/bridge/v2/instancias', { rotulo }),
   urlMidia: (dados) => chamar('POST', '/api/crm/bridge/v2/midia', dados),
