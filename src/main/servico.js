@@ -124,6 +124,7 @@ async function cicloHeartbeat() {
         ausentes.delete(inst.id);
         if (motor.temSessaoSalva(inst.id)) await motor.iniciar(inst);
         else motor.conhecer(inst);
+        motor.atualizarRotulo(inst); // "Renomear" no Mini CRM
       }
       // removido no CRM: depois de dois heartbeats seguidos sem ele, sai dos aparelhos conectados do celular
       for (const n of motor.listarNumeros()) {
