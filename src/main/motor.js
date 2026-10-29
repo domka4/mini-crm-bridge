@@ -5,7 +5,8 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import { logger } from '../logger.js';
 import { usarSessaoCifrada } from './sessaoCifrada.js';
-import { canal, emitirEvento } from './canal.js';
+import { emitirEvento } from './canal.js';
+import * as midiaLocal from './midiaLocal.js';
 
 // Motor do WhatsApp do Mini CRM (docs/08 §3.1): uma sessão do Baileys por número, rodando neste PC,
 // na mesma rede do celular. Sem proxy, sem túnel, sem servidor Evolution.
@@ -189,10 +190,10 @@ function conteudoDe(mensagem) {
   if (m.protocolMessage || m.reactionMessage || (m.senderKeyDistributionMessage && Object.keys(m).length === 1)) return null;
   if (m.conversation) return { tipo: 'texto', texto: m.conversation };
   if (m.extendedTextMessage?.text) return { tipo: 'texto', texto: m.extendedTextMessage.text };
-  if (m.imageMessage) return { tipo: 'imagem', texto: m.imageMessage.caption, mime: m.imageMessage.mimetype, nome: 'imagem.jpg' };
-  if (m.videoMessage) return { tipo: 'video', texto: m.videoMessage.caption, mime: m.videoMessage.mimetype, nome: 'video.mp4' };
+  if (m.imageMessage) return { tipo: 'imagem', texto: m.imageMessage.caption, mime: m.imageMessage.mimetype, nome: 'imagem.jpg', miniatura: m.imageMessage.jpegThumbnail };
+  if (m.videoMessage) return { tipo: 'video', texto: m.videoMessage.caption, mime: m.videoMessage.mimetype, nome: 'video.mp4', miniatura: m.videoMessage.jpegThumbnail };
   if (m.audioMessage) return { tipo: 'audio', mime: m.audioMessage.mimetype, nome: 'audio.ogg' };
-  if (m.documentMessage) return { tipo: 'documento', texto: m.documentMessage.caption, mime: m.documentMessage.mimetype, nome: m.documentMessage.fileName || 'documento' };
+  if (m.documentMessage) return { tipo: 'documento', texto: m.documentMessage.caption, mime: m.documentMessage.mimetype, nome: m.documentMessage.fileName || 'documento', miniatura: m.documentMessage.jpegThumbnail };
   if (m.stickerMessage) return { tipo: 'figurinha', mime: m.stickerMessage.mimetype, nome: 'figurinha.webp' };
   return { tipo: 'outro' };
 }
@@ -236,18 +237,18 @@ async function tratarMensagem(instanciaId, s, m, lote = 'notify') {
   }
   if (s.numero && jid === `${s.numero}@s.whatsapp.net`) return; // conversa consigo mesmo
 
-  let midia_url;
+  // mídia fica neste PC; para o CRM vai só a miniatura (o arquivo sobe sob demanda, comando midia.copia)
+  let midia_local;
+  let miniatura;
   if (c.mime) {
+    let buf;
     try {
-      const buf = await B.downloadMediaMessage(m, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: s.sock?.updateMediaMessage });
-      if (buf.length <= 16 * 1024 * 1024) {
-        const u = await canal.urlMidia({ instancia_id: instanciaId, nome: c.nome, tipo: c.mime, tamanho: buf.length });
-        const up = await fetch(u.url_upload, { method: 'PUT', headers: { 'Content-Type': c.mime }, body: buf });
-        if (up.ok) midia_url = u.url_publica;
-      }
+      buf = await B.downloadMediaMessage(m, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: s.sock?.updateMediaMessage });
+      midia_local = midiaLocal.guardar(instanciaId, key.id, c.mime, c.nome, buf);
     } catch (e) {
-      logger.warn(`Mídia recebida não foi salva: ${e.message}`);
+      logger.warn(`Mídia não foi salva neste PC: ${e.message}`);
     }
+    miniatura = midiaLocal.miniatura(c, buf);
   }
 
   emitirEvento({
@@ -259,7 +260,8 @@ async function tratarMensagem(instanciaId, s, m, lote = 'notify') {
       ...(m.pushName && !key.fromMe ? { nome: String(m.pushName).slice(0, 120) } : {}),
       ...(c.texto ? { texto: c.texto } : {}),
       midia_tipo: c.tipo,
-      ...(midia_url ? { midia_url } : {}),
+      ...(midia_local ? { midia_local } : {}),
+      ...(miniatura ? { miniatura } : {}),
       enviada_em: new Date(Number(m.messageTimestamp || Date.now() / 1000) * 1000).toISOString(),
     },
   });

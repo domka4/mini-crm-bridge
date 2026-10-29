@@ -30,7 +30,6 @@ export const canal = {
     undefined, { timeoutMs: (espera + 15) * 1000 }),
   resultado: (id, ok, resultado, erro) => chamar('POST', `/api/crm/bridge/v2/comandos/${id}/resultado`, { ok, resultado, erro }),
   criarNumero: (rotulo) => chamar('POST', '/api/crm/bridge/v2/instancias', { rotulo }),
-  urlMidia: (dados) => chamar('POST', '/api/crm/bridge/v2/midia', dados),
   enviarEventos: (lista) => chamar('POST', '/api/crm/bridge/v2/eventos', lista, { timeoutMs: 60000 }),
 };
 

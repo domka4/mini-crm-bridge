@@ -1,7 +1,9 @@
 import { logger } from '../logger.js';
 import * as cofre from './cofre.js';
 import { canal, emitirEvento } from './canal.js';
+import fs from 'node:fs';
 import * as motor from './motor.js';
+import * as midiaLocal from './midiaLocal.js';
 
 // Execução dos comandos do CRM (docs/08 §4) com o ritmo anti-ban (docs/08 §6):
 // - envios: um de cada vez por número, intervalo aleatório entre eles, "digitando…" antes;
@@ -175,12 +177,20 @@ async function enviarMensagem(cmd) {
     } catch (_) {}
   }
 
+  // mídia: baixa uma vez, envia e guarda a cópia neste PC (o CRM apaga a da nuvem depois do envio)
+  let arquivo = null;
+  if (p.tipo !== 'texto') {
+    const r = await fetch(p.midia_url, { signal: AbortSignal.timeout(60000) });
+    if (!r.ok) throw new Error(`não consegui baixar o arquivo do CRM (HTTP ${r.status})`);
+    arquivo = { buf: Buffer.from(await r.arrayBuffer()), mime: r.headers.get('content-type') || 'application/octet-stream' };
+  }
+
   let conteudo;
   if (p.tipo === 'texto') conteudo = { text: p.texto };
-  else if (p.tipo === 'imagem') conteudo = { image: { url: p.midia_url }, caption: p.texto };
-  else if (p.tipo === 'video') conteudo = { video: { url: p.midia_url }, caption: p.texto };
-  else if (p.tipo === 'audio') conteudo = { audio: { url: p.midia_url }, mimetype: 'audio/ogg; codecs=opus', ptt: true };
-  else if (p.tipo === 'documento') conteudo = { document: { url: p.midia_url }, fileName: p.nome_arquivo || 'arquivo', caption: p.texto };
+  else if (p.tipo === 'imagem') conteudo = { image: arquivo.buf, caption: p.texto };
+  else if (p.tipo === 'video') conteudo = { video: arquivo.buf, caption: p.texto };
+  else if (p.tipo === 'audio') conteudo = { audio: arquivo.buf, mimetype: 'audio/ogg; codecs=opus', ptt: true };
+  else if (p.tipo === 'documento') conteudo = { document: arquivo.buf, mimetype: arquivo.mime, fileName: p.nome_arquivo || 'arquivo', caption: p.texto };
 
   if (p.mencionar_todos && jid.endsWith('@g.us')) {
     const meta = await sock.groupMetadata(jid);
@@ -189,8 +199,14 @@ async function enviarMensagem(cmd) {
 
   const msg = await sock.sendMessage(jid, conteudo);
   if (msg?.key?.id) motor.enviadosPeloBridge.add(msg.key.id);
+  let midia_local;
+  if (arquivo && msg?.key?.id) {
+    const nome = p.nome_arquivo || { imagem: 'imagem.jpg', video: 'video.mp4', audio: 'audio.ogg' }[p.tipo] || 'arquivo';
+    try { midia_local = midiaLocal.guardar(cmd.instancia_id, msg.key.id, arquivo.mime, nome, arquivo.buf); }
+    catch (e) { logger.warn(`Cópia da mídia enviada não ficou neste PC: ${e.message}`); }
+  }
   logger.info(`Mensagem enviada para …${String(jid).split('@')[0].slice(-4)}${p.ritmo === 'conversa' ? '' : ' (campanha)'}.`);
-  return { wa_id: msg?.key?.id || null };
+  return { wa_id: msg?.key?.id || null, ...(midia_local ? { midia_local } : {}) };
 }
 
 async function executar(cmd) {
@@ -248,6 +264,16 @@ async function executar(cmd) {
       case 'grupo.entrar': {
         const sock = motor.socketConectado(cmd.instancia_id);
         return { ok: true, resultado: { jid: await sock.groupAcceptInvite(p.convite) } };
+      }
+      case 'midia.copia': {
+        const caminho = midiaLocal.achar(cmd.instancia_id, p.wa_id);
+        if (!caminho) return { ok: false, erro: 'o arquivo não está mais neste computador' };
+        const buf = fs.readFileSync(caminho);
+        const up = await fetch(p.url_upload, {
+          method: 'PUT', headers: { 'Content-Type': p.mime || 'application/octet-stream' }, body: buf, signal: AbortSignal.timeout(120000),
+        });
+        if (!up.ok) throw new Error(`a nuvem recusou a cópia (HTTP ${up.status})`);
+        return { ok: true, resultado: { tamanho: buf.length } };
       }
       case 'grupo.atualizar': {
         const sock = motor.socketConectado(cmd.instancia_id);
