@@ -1,0 +1,2 @@
+// Ícone da bandeja (32x32), gerado sem dependências.
+export const ICONE_BANDEJA = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAiElEQVR4nO3USw6AMAhF0S7BaFywy3J1ddyqhN8DSSRh2nsGDa1Vm21fO7UpUShGGzcjrGETxDsuQqDibEQqAB0nEVHxV4T0geU8hg0DzGEtBBJXI0oAuHEJ4gfUAqR/Qigg/RCVOsVeewNEIh7jUQgy/gkAEsGKoxCiuCdEHfZAuMSlGEgUORecO+KaP3e4cwAAAABJRU5ErkJggg==';

@@ -4,7 +4,8 @@ import { defineConfig } from 'vite';
 export default defineConfig({
   build: {
     rollupOptions: {
-      external: ['ssh2', 'cpu-features']
-    }
-  }
+      // carregados de node_modules na hora de rodar: o Baileys é ESM e traz as próprias dependências
+      external: ['baileys', 'pino', 'qrcode', 'electron-updater'],
+    },
+  },
 });
