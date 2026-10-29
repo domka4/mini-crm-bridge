@@ -100,8 +100,9 @@ export async function iniciar(instancia) {
     sock.ev.on('creds.update', s.sessao.salvarCreds);
     sock.ev.on('connection.update', (u) => tratarConexao(instancia, s, sock, u).catch((e) => logger.error(`conexão ${s.rotulo}: ${e.message}`)));
     sock.ev.on('messages.upsert', ({ messages, type }) => {
-      if (type !== 'notify') return;
-      for (const m of messages) tratarMensagem(instancia.id, s, m).catch((e) => logger.warn(`mensagem não processada: ${e.message}`));
+      // notify = ao vivo; append = chegou enquanto o Bridge estava fechado (o CRM ignora repetidas pelo wa_id)
+      if (type !== 'notify' && type !== 'append') return;
+      for (const m of messages) tratarMensagem(instancia.id, s, m, type).catch((e) => logger.warn(`mensagem não processada: ${e.message}`));
     });
     sock.ev.on('messages.update', (lista) => {
       for (const { key, update } of lista) {
@@ -182,7 +183,8 @@ async function tratarConexao(instancia, s, sock, u) {
 }
 
 function conteudoDe(mensagem) {
-  const m = mensagem?.ephemeralMessage?.message || mensagem?.viewOnceMessage?.message || mensagem?.viewOnceMessageV2?.message || mensagem;
+  // tira os envelopes (temporária, visualização única, editada, documento com legenda…)
+  const m = B.normalizeMessageContent ? B.normalizeMessageContent(mensagem) : mensagem;
   if (!m) return null;
   if (m.protocolMessage || m.reactionMessage || (m.senderKeyDistributionMessage && Object.keys(m).length === 1)) return null;
   if (m.conversation) return { tipo: 'texto', texto: m.conversation };
@@ -195,29 +197,47 @@ function conteudoDe(mensagem) {
   return { tipo: 'outro' };
 }
 
-/** JID de telefone do contato; mensagens com identificador @lid são resolvidas para o número. */
+/**
+ * JID de telefone do contato. Conversas no modo novo do WhatsApp (@lid) são resolvidas para o número:
+ * na recebida, o WhatsApp manda o número do remetente junto (remoteJidAlt); na enviada pelo celular,
+ * esse campo é o NOSSO número, então o contato sai do mapa LID → número do próprio Baileys.
+ */
 async function jidDoContato(s, key) {
-  let jid = key.remoteJid;
-  if (jid && jid.endsWith('@lid')) {
-    jid = key.remoteJidAlt || key.senderPn || null;
-    if (!jid) {
-      try { jid = await s.sock?.signalRepository?.lidMapping?.getPNForLID?.(key.remoteJid); } catch (_) { jid = null; }
-    }
-  }
-  return jid ? B.jidNormalizedUser(jid) : null;
+  const r = key.remoteJid || '';
+  if (r.endsWith('@s.whatsapp.net')) return B.jidNormalizedUser(r);
+  if (!r.endsWith('@lid')) return null;
+  if (!key.fromMe && String(key.remoteJidAlt || '').endsWith('@s.whatsapp.net')) return B.jidNormalizedUser(key.remoteJidAlt);
+  try {
+    const pn = await s.sock?.signalRepository?.lidMapping?.getPNForLID?.(r);
+    if (pn) return B.jidNormalizedUser(pn);
+  } catch (_) {}
+  return null;
 }
 
-async function tratarMensagem(instanciaId, s, m) {
+const ATRASO_MAXIMO_MS = 3 * 24 * 3600 * 1000; // mensagem guardada pelo WhatsApp: só as dos últimos 3 dias
+const finalDe = (jid) => String(jid).split('@')[0].slice(-4);
+
+async function tratarMensagem(instanciaId, s, m, lote = 'notify') {
   const key = m.key || {};
-  if (!m.message || key.remoteJid === 'status@broadcast' || B.isJidGroup(key.remoteJid)) return;
+  const r = key.remoteJid || '';
+  if (!r || r.endsWith('@broadcast') || B.isJidGroup(r) || r.endsWith('@newsletter')) return;
   if (key.fromMe && enviadosPeloBridge.has(key.id)) return;
+  if (lote === 'append' && Date.now() - Number(m.messageTimestamp || 0) * 1000 > ATRASO_MAXIMO_MS) return;
+  if (!m.message) {
+    if (m.messageStubType) logger.warn('Uma mensagem não pôde ser lida agora; o WhatsApp reenvia em seguida.');
+    return;
+  }
   const c = conteudoDe(m.message);
   if (!c) return;
   const jid = await jidDoContato(s, key);
-  if (!jid || !jid.endsWith('@s.whatsapp.net')) return;
+  if (!jid) {
+    logger.warn(`Mensagem ${key.fromMe ? 'enviada pelo celular' : 'recebida'} sem número identificável; não foi para o CRM.`);
+    return;
+  }
+  if (s.numero && jid === `${s.numero}@s.whatsapp.net`) return; // conversa consigo mesmo
 
   let midia_url;
-  if (c.mime && !key.fromMe) {
+  if (c.mime) {
     try {
       const buf = await B.downloadMediaMessage(m, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: s.sock?.updateMediaMessage });
       if (buf.length <= 16 * 1024 * 1024) {
@@ -243,6 +263,7 @@ async function tratarMensagem(instanciaId, s, m) {
       enviada_em: new Date(Number(m.messageTimestamp || Date.now() / 1000) * 1000).toISOString(),
     },
   });
+  logger.info(key.fromMe ? `Mensagem enviada pelo celular para …${finalDe(jid)}.` : `Mensagem recebida de …${finalDe(jid)}.`);
 }
 
 /** Socket conectado do número, ou erro claro. */
