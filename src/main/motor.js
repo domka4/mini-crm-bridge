@@ -66,6 +66,15 @@ export function conhecer(instancia) {
   avisarUI();
 }
 
+/** Nome do número renomeado no Mini CRM: a tela troca no próximo heartbeat, sem reconectar. */
+export function atualizarRotulo(instancia) {
+  const s = sessoes.get(instancia.id);
+  const rotulo = instancia.rotulo || instancia.instance_name;
+  if (!s || !rotulo || s.rotulo === rotulo) return;
+  s.rotulo = rotulo;
+  avisarUI();
+}
+
 function emitirConexao(instanciaId, estado, numero) {
   emitirEvento({ tipo: 'status_conexao', instancia_id: instanciaId, dados: { estado, ...(numero ? { numero } : {}) } });
 }
