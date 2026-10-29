@@ -129,7 +129,7 @@ function tratar(nome, fn) {
 
 tratar('estado', () => estadoCompleto());
 tratar('parear', (codigo, nome) => servico.parear(String(codigo || ''), String(nome || os.hostname()).slice(0, 60)));
-tratar('adicionar-numero', (rotulo) => servico.adicionarNumero(String(rotulo || '').slice(0, 40)));
+tratar('adicionar-numero', (rotulo, visibilidade) => servico.adicionarNumero(String(rotulo || '').slice(0, 40), visibilidade === 'dono' ? 'dono' : 'todos'));
 tratar('conectar-numero', (id) => servico.conectarNumero(id));
 tratar('desconectar-numero', (id) => servico.desconectarNumero(id));
 tratar('desparear', () => servico.desparear());

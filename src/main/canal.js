@@ -29,7 +29,8 @@ export const canal = {
     `/api/crm/bridge/v2/comandos?espera=${espera}&limite=${limite}` + (prioridadeMin !== null ? `&prioridade_min=${prioridadeMin}` : ''),
     undefined, { timeoutMs: (espera + 15) * 1000 }),
   resultado: (id, ok, resultado, erro) => chamar('POST', `/api/crm/bridge/v2/comandos/${id}/resultado`, { ok, resultado, erro }),
-  criarNumero: (rotulo) => chamar('POST', '/api/crm/bridge/v2/instancias', { rotulo }),
+  // visibilidade: 'todos' (o projeto vê as conversas) ou 'dono' (só quem conectou este PC)
+  criarNumero: (rotulo, visibilidade = 'todos') => chamar('POST', '/api/crm/bridge/v2/instancias', { rotulo, visibilidade }),
   enviarEventos: (lista) => chamar('POST', '/api/crm/bridge/v2/eventos', lista, { timeoutMs: 60000 }),
 };
 

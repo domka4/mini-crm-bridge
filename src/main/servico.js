@@ -58,8 +58,8 @@ export async function desparear() {
   mudar({ pareado: false, conta: null, dispositivo: null, crmOnline: null, aviso: null });
 }
 
-export async function adicionarNumero(rotulo) {
-  const r = await canal.criarNumero(rotulo);
+export async function adicionarNumero(rotulo, visibilidade) {
+  const r = await canal.criarNumero(rotulo, visibilidade);
   await motor.iniciar(r.instancia);
   return obterEstado();
 }
